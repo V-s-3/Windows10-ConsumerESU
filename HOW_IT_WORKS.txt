@@ -1,0 +1,239 @@
+================================================================
+Activate_ESU.cmd — что делает, что читает, что меняет
+================================================================
+
+Этот документ объясняет построчно, что происходит при запуске
+скрипта на тестовом Windows 10 22H2 (build 19045.6036+).
+
+----------------------------------------------------------------
+0. ЗАПУСК (CMD-часть, строки 1–34)
+----------------------------------------------------------------
+
+При двойном клике по Activate_ESU.cmd:
+
+1) Сохраняется путь к самому себе в переменную _cmdf
+   (обязательно ДО проверки на администратора — иначе окно
+   перезапустится с пустым путём и закроется).
+
+2) fltmc проверяет что скрипт запущен от администратора.
+   Если нет — PowerShell вызывает Start-Process с -Verb RunAs,
+   что показывает UAC-диалог. После подтверждения открывается
+   новое окно уже с правами админа.
+
+3) Извлекается встроенный PowerShell-код: всё что после маркера
+   ::PSBLOCK читается из текущего .cmd как UTF-8, пишется во
+   временный .ps1 (%TEMP%\esu_activate_<random>.ps1), затем
+   запускается через powershell -File с ExecutionPolicy Bypass.
+
+4) После выполнения временный .ps1 удаляется.
+5) Выводится "Done. Press any key to exit." и ждётся клавиша.
+
+----------------------------------------------------------------
+1. ПРЕДПРОВЕРКИ (PowerShell, строки 100–122)
+----------------------------------------------------------------
+
+Скрипт проверяет три условия, иначе сразу выходит с ошибкой:
+
+- PowerShell работает в Full Language Mode (не ConstrainedLanguage)
+- Процесс действительно запущен от администратора
+  (повторная проверка — на случай если CMD прошёл обходным путём)
+- Присутствует файл C:\Windows\System32\ConsumerESUMgr.dll
+  (ставится обновлением KB5061087 от июня 2025)
+
+----------------------------------------------------------------
+2. ЧТО СКРИПТ ЧИТАЕТ ИЗ СИСТЕМЫ (без изменений)
+----------------------------------------------------------------
+
+Реестр:
+  HKCU:\Control Panel\International\Geo
+    - Nation (GeoID, напр. 203=RU, 244=US)
+    - Name   (ISO-код, напр. "RU", "US")
+
+  HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Control Panel\DeviceRegion
+    - DeviceRegion (DWORD, если задан на устройстве)
+
+  HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SoftwareProtectionPlatform\ESU
+    - Win10CommercialKeybasedESUEligible
+    - Win10CommercialAzureESUEligible
+    - win10ConsumerESUStatus
+
+  HKCU:\Software\Microsoft\Windows NT\CurrentVersion\Windows\ConsumerESU
+    - ESUEligibility       (кэш статуса от предыдущего запуска)
+    - ESUEligibilityResult (кэш кода результата)
+
+  HKCU:\Software\Microsoft\Windows\CurrentVersion\Store
+    - PrimaryWebAccountId (ID аккаунта Microsoft Store)
+
+Файлы:
+  C:\Windows\System32\ConsumerESUMgr.dll — DLL с API энролмента
+  C:\Windows\System32\ClipESUConsumer.exe — CLI для проверки прав
+  C:\Windows\System32\IntegratedServicesRegionPolicySet.json
+    — JSON с region-политиками. Скрипт ищет в нём запись
+      {1d290cdb-499c-4d42-938a-9b8dceffe998} чтобы понять
+      попадает ли устройство под DMA/EEA (Digital Markets Act).
+
+WMI/CIM:
+  SoftwareLicensingProduct — список установленных ESU-лицензий
+    фильтр: ApplicationId='55c92734-...' AND LicenseStatus=1
+
+Службы и задачи:
+  Служба DiagTrack — текущий тип запуска
+  Scheduled Task \Microsoft\Windows\Flighting\FeatureConfig\ReconcileFeatures
+
+----------------------------------------------------------------
+3. ПОШАГОВОЕ ВЫПОЛНЕНИЕ
+----------------------------------------------------------------
+
+[Step 0] Проверка существующей Commercial ESU
+   Читает HKLM SPP ESU + CIM SoftwareLicensingProduct.
+   Если найдены активные ESU-Year лицензии (от TSforge/MAS) —
+   выводит их имена и ВЫХОДИТ С УСПЕХОМ. Commercial ESU по
+   словам abbodi1406 эквивалентна Consumer ESU, значит ничего
+   делать не нужно.
+
+[Step 1] Проверка региона
+   Читает HKCU Geo\Nation. Если GeoID входит в список
+   embargoed-стран (203 RU, 112 BY, 141 KP, 148 SY, 170 IR,
+   261 CU) — применяет временный обход:
+
+   ИЗМЕНЕНИЕ: Set-WinHomeLocation -GeoId 244
+     Этот cmdlet обновляет HKCU Nation+Name, вызывает
+     kernel32!SetUserGeoID, рассылает WM_SETTINGCHANGE "intl"
+     чтобы WinRT GlobalizationPreferences обновил кэш.
+
+   ИЗМЕНЕНИЕ (если HKLM DeviceRegion уже существует):
+     reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion
+     \Control Panel\DeviceRegion" /v DeviceRegion
+     /t REG_DWORD /d 244 /f
+     (копирует reg.exe в reg1.exe для обхода политики TrustedInstaller)
+
+   Запоминает оригинальный GeoID для восстановления в конце.
+
+[Step 2] Включение Consumer ESU feature flag
+
+   ИЗМЕНЕНИЕ (если флаг выключен):
+     Записывает в HKLM:\SYSTEM\CurrentControlSet\Policies
+     \Microsoft\FeatureManagement\Overrides значение "4011992206"
+     (DWORD=2 — Enabled). ID фичи 57517687.
+
+     Вызывает ntdll!RtlSetFeatureConfigurations чтобы изменение
+     применилось без перезагрузки.
+
+   ИЗМЕНЕНИЕ (если устройство в EEA/DMA регионе):
+     Отключает проверки EEA-политик — ещё 3 feature flag ID:
+     58992578, 58755790, 59064570.
+
+   ЗАПУСКАЕТ scheduled task:
+     \Microsoft\Windows\Flighting\FeatureConfig\ReconcileFeatures
+
+[Step 3] Проверка eligibility
+
+   ИЗМЕНЕНИЕ: удаляет кэш HKCU\...\ConsumerESU
+     ESUEligibility и ESUEligibilityResult — иначе
+     ClipESUConsumer может вернуть устаревший embargo-результат.
+
+   ЗАПУСКАЕТ: ClipESUConsumer.exe -evaluateEligibility
+   Этот EXE пишет свежий результат обратно в HKCU:
+     ESUEligibility (DWORD) — статус (0..14)
+     ESUEligibilityResult (DWORD) — код причины (1..15,100..113)
+
+   Анализирует результат:
+   - Status 3 + Result 1 → уже энроллен, успех
+   - Result 12 (KEY_BASED_ESU) → commercial ESU активна, успех
+   - Статусы 2..5, 11..14, (1 или 10)+(result 13..15) → OK, идём дальше
+   - Иначе → ошибка, выход
+
+[Step 4] Получение MSA-токена
+   Пробует 3 способа через WinRT:
+   1) TokenMsAccountUser — WebAuthenticationCoreManager
+      с login.windows.local (аккаунт входа в Windows)
+   2) TokenMsAccountStore — через PrimaryWebAccountId
+      из HKCU Store (аккаунт Microsoft Store)
+   3) TokenLocalAccount — OnlineIdSystemAuthenticator
+      (локальный аккаунт)
+
+   Токен нужен для авторизации перед Microsoft API.
+   Токен держится в памяти, в реестр НЕ пишется.
+
+[Step 5] Энролмент
+
+   P/Invoke: ConsumerESUMgr.dll!EnrollUsingBackupV1
+   с полученным MSA-токеном. Microsoft привязывает ESU-лицензию
+   к этому Microsoft-аккаунту на серверах Microsoft.
+
+[Step 6] Проверка результата
+   Снова ClipESUConsumer.exe -evaluateEligibility.
+   Если Status=3 (DeviceEnrolled) и Result=1 (SUCCESS) — успех.
+
+[Cleanup]
+   Если обходили регион — восстанавливает оригинальный GeoID
+   через Set-WinHomeLocation.
+
+----------------------------------------------------------------
+4. ЧТО ОСТАЁТСЯ В СИСТЕМЕ ПОСЛЕ УСПЕХА
+----------------------------------------------------------------
+
+Постоянные изменения (сохраняются):
+  HKLM:\...\FeatureManagement\Overrides — Consumer ESU feature flag
+  HKLM:\...\SoftwareProtectionPlatform\ESU\win10ConsumerESUStatus
+  ClipSVC получает новую ESU-лицензию от Microsoft (онлайн)
+
+Временные изменения (откатываются в [Cleanup]):
+  HKCU:\...\Geo\Nation и Name — возвращаются к оригиналу
+  HKLM:\...\DeviceRegion — возвращается (если менялся)
+
+ВАЖНО:
+  После успешного энролмента Microsoft обновляет статус
+  через scheduled task \Microsoft\Windows\Clip\ClipEsuConsumer
+  (ежедневно). Если во время этой задачи регион снова RU —
+  Microsoft МОЖЕТ отозвать энролмент в течение 24 часов.
+  Решение: отключить эти задачи после энролмента
+  (это НЕ делается этим скриптом — делайте вручную или
+   через отдельный скрипт abbodi1406/Consumer_ESU_ScheduledTasks.cmd).
+
+----------------------------------------------------------------
+5. ЧТО СКРИПТ НЕ ДЕЛАЕТ (безопасность)
+----------------------------------------------------------------
+
+- Не меняет пароли, аккаунты, учётные записи
+- Не отправляет данные пользователя куда-либо (кроме Microsoft
+  в рамках стандартного энролмента)
+- Не отключает Windows Defender, UAC, firewall
+- Не устанавливает сторонние программы
+- Не редактирует системные EXE/DLL
+- Все обращения — к документированным Microsoft API
+
+----------------------------------------------------------------
+6. КОДЫ РЕЗУЛЬТАТОВ (eeResult)
+----------------------------------------------------------------
+   1  SUCCESS                          — энролмент прошёл
+   2  CONSUMER_ESU_PROGRAM_NOT_ACTIVE — программа ещё не стартовала
+   3  NON_CONSUMER_DEVICE             — устройство не для потребителей
+   4  COMMERCIAL_DEVICE               — коммерческое устройство
+   5  NON_ADMIN                       — не под админом
+   6  CHILD_ACCOUNT                   — детский аккаунт
+   7  REGION_IN_EMBARGOED_COUNTRY     — страна под embargo
+   8  AZURE_DEVICE                    — виртуалка в Azure
+   9  COMMERCIAL_MIGRATED_DEVICE
+   11 CONSUMER_ESU_FEATURE_DISABLED   — feature flag не включён
+   12 KEY_BASED_ESU                   — есть commercial ESU
+                                        (это НЕ ошибка!)
+   13 EEA_REGION_POLICY_ENABLED
+   14 WARN_INACTIVE_MSA
+   15 REENROLL_REQ_INACTIVE_MSA
+
+----------------------------------------------------------------
+7. КРЕДИТЫ
+----------------------------------------------------------------
+
+Основа: abbodi1406/ConsumerESU
+   https://github.com/abbodi1406/ConsumerESU
+
+Доработки для тестовой среды:
+- Автоматический self-elevate без параметров
+- Детекция уже установленной commercial ESU (TSforge/MAS)
+- Set-WinHomeLocation вместо raw-реестра для надёжности
+- Очистка кэша eligibility перед проверкой
+- Обход embargo-регионов (RU/BY/KP/SY/IR/CU)
+- Единый .cmd-файл с embedded PowerShell
+- Пошаговый вывод что именно делается
