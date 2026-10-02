@@ -28,7 +28,7 @@ del "%psfile%" >nul 2>&1
 
 echo.
 echo  ==========================================
-echo  Completed. Press any key to exit.
+echo  Done. Press any key to exit.
 echo  ==========================================
 pause >nul
 exit /b
@@ -52,11 +52,11 @@ function ExitScript($ExitCode = 0)
 {
 	if ($ExitCode -eq 0) {
 		CONOUT "`n=========================================="
-		CONOUT "  ESU Activation Completed Successfully"
+		CONOUT "  Done. ESU Activation Successful."
 		CONOUT "=========================================="
 	} else {
 		CONOUT "`n=========================================="
-		CONOUT "  ESU Activation Finished with Errors"
+		CONOUT "  Done. ESU Activation Finished with Errors."
 		CONOUT "=========================================="
 	}
 	Exit $ExitCode
@@ -177,14 +177,49 @@ function NativeMethods
 	$Win32 = $t.CreateType()
 }
 
+$geoCodeMap = @{
+	244 = "US"; 84 = "GB"; 123 = "NL"; 203 = "RU"; 112 = "BY"; 141 = "KP";
+	148 = "SY"; 170 = "IR"; 261 = "CU"; 39 = "CN"; 94 = "DE"; 68 = "CA";
+}
+
 function ReRegion($gID)
 {
+	$gName = $geoCodeMap[[int]$gID]
+	CONOUT ("    -> Setting HKCU:\Control Panel\International\Geo\Nation = {0}" -f $gID)
 	$null = New-ItemProperty $gKey "Nation" -Value $gID -Type String -Force -EA 0
-	if ($null -ne (Get-ItemProperty $rKey -EA 0)) {
+	if ($null -ne $gName) {
+		CONOUT ("    -> Setting HKCU:\Control Panel\International\Geo\Name = {0}" -f $gName)
+		$null = New-ItemProperty $gKey "Name" -Value $gName -Type String -Force -EA 0
+	}
+	# Update HKU:\.DEFAULT (used by SYSTEM-context readers)
+	try {
+		if (-Not (Test-Path "HKU:")) {
+			$null = New-PSDrive -Name HKU -PSProvider Registry -Root HKEY_USERS -EA 0
+		}
+		$duKey = "HKU:\.DEFAULT\Control Panel\International\Geo"
+		if (-Not (Test-Path $duKey)) { $null = New-Item $duKey -Force -EA 0 }
+		CONOUT ("    -> Setting HKU:\.DEFAULT\...\Geo\Nation = {0}" -f $gID)
+		$null = New-ItemProperty $duKey "Nation" -Value $gID -Type String -Force -EA 0
+		if ($null -ne $gName) {
+			$null = New-ItemProperty $duKey "Name" -Value $gName -Type String -Force -EA 0
+		}
+	} catch {}
+	# Update HKLM DeviceRegion unconditionally (create if missing)
+	try {
+		$rParent = $rKey -replace '\\DeviceRegion$', ''
+		if (-Not (Test-Path $rParent)) { $null = New-Item $rParent -Force -EA 0 }
+		CONOUT ("    -> Setting HKLM:\...\CurrentVersion\Control Panel\DeviceRegion = {0}" -f $gID)
 		Copy-Item (Get-Command reg.exe).Source .\reg1.exe -Force -EA 0
 		& .\reg1.exe add "$($rKey.Replace(':',''))" /v DeviceRegion /t REG_DWORD /d $gID /f > $null 2>&1
 		Remove-Item .\reg1.exe -Force -EA 0
-	}
+	} catch {}
+	# Also set via native Win32 SetUserGeoID API through PowerShell so current session cache updates
+	try {
+		CONOUT ("    -> Calling kernel32.SetUserGeoID({0})" -f $gID)
+		$sig = '[DllImport("kernel32.dll")] public static extern bool SetUserGeoID(int GeoId);'
+		$k32 = Add-Type -MemberDefinition $sig -Name "Kern32" -Namespace "Win32Geo" -PassThru -EA 0
+		$null = $k32::SetUserGeoID([int]$gID)
+	} catch {}
 }
 #endregion
 
@@ -626,31 +661,44 @@ $BSD = RtlBSD
 $origGeoId = $GeoId
 $regionBypassed = $false
 CONOUT "`n[Step 1] Checking region..."
+CONOUT ("  Current GeoID: {0} (Name: {1})" -f $GeoId, $GeoCN)
 $embargoList = @(203, 112, 141, 148, 170, 261)
 if ($embargoList -contains [int]$GeoId) {
-	CONOUT "Region is restricted for ESU. Applying bypass (US)..."
+	CONOUT "  Region is restricted for ESU (embargoed country)."
+	CONOUT "  Applying temporary bypass to GeoID 244 (United States)..."
 	ReRegion 244
 	$regionBypassed = $true
 	$DMA_SSO = $false
+	CONOUT "  Region bypass applied."
+} else {
+	CONOUT "  Region is OK, no bypass needed."
 }
 #endregion
 
 CONOUT "`n[Step 2] Enabling ESU feature..."
+CONOUT "  Starting required service (DiagTrack if needed)..."
 RunService
+CONOUT "  Querying ESU feature flag (ID 57517687)..."
 $featureESU = QueryConfig 57517687
 if (!$featureESU) {
-	CONOUT "Activating Consumer ESU feature flag..."
+	CONOUT "  Feature is OFF. Activating Consumer ESU feature flag..."
+	CONOUT "    -> Writing feature override to:"
+	CONOUT "       HKLM:\SYSTEM\CurrentControlSet\Policies\Microsoft\FeatureManagement\Overrides"
+	CONOUT "    -> Calling RtlSetFeatureConfigurations API (ntdll.dll)"
 	SetConfig 57517687 2 "4011992206"
+	CONOUT "  Feature flag activated."
 } else {
-	CONOUT "ESU feature already enabled."
+	CONOUT "  ESU feature is already enabled."
 }
 if ($DMA_SSO) {
-	CONOUT "`nDisable EEA_REGION_POLICY_CHECK features ..."
+	CONOUT "`n  Disabling EEA_REGION_POLICY_CHECK features (DMA region)..."
+	CONOUT "    -> Feature 58992578, 58755790, 59064570"
 	SetConfig 58992578 1 "2216818319"
 	SetConfig 58755790 1 "2642149007"
 	SetConfig 59064570 1 "4109366415"
 }
 if (!$featureESU -Or $DMA_SSO) {
+	CONOUT "  Running ReconcileFeatures scheduled task to apply changes..."
 	RunTask
 }
 RevertService
@@ -671,38 +719,49 @@ if ($hRet -eq 0x80080002) {
 
 #region Main
 CONOUT "`n[Step 3] Checking ESU eligibility..."
+CONOUT "  Running: $SysPath\ClipESUConsumer.exe -evaluateEligibility"
+CONOUT "  (writes result to HKCU:\Software\Microsoft\Windows NT\CurrentVersion\Windows\ConsumerESU)"
 . CheckEligibility
 $supported = $false
 if ($null -ne $esuStatus) {
 	$supported = ($esuStatus -ge 2 -And $esuStatus -le 5) -Or ($esuStatus -ge 11 -And $esuStatus -le 14) -Or (($esuStatus -eq 1 -Or $esuStatus -eq 10) -And ($esuResult -ge 13 -And $esuResult -le 15))
 }
 if (!$supported) {
-	CONOUT "`nEligibility status is not supported for enrollment."
-	if ($regionBypassed) { ReRegion $origGeoId }
+	CONOUT "`n  Eligibility status is not supported for enrollment."
+	if ($regionBypassed) {
+		CONOUT "  Restoring original GeoID $origGeoId ..."
+		ReRegion $origGeoId
+	}
 	ExitScript 1
 }
 if ($esuResult -eq 1 -And $esuStatus -eq 3) {
-	CONOUT "`nYour PC is already enrolled for Consumer ESU. OK!"
-	if ($regionBypassed) { ReRegion $origGeoId }
+	CONOUT "`n  Your PC is already enrolled for Consumer ESU. OK!"
+	if ($regionBypassed) {
+		CONOUT "  Restoring original GeoID $origGeoId ..."
+		ReRegion $origGeoId
+	}
 	ExitScript 0
 }
 
 CONOUT "`n[Step 4] Obtaining authorization token..."
+CONOUT "  Trying Microsoft Account user token (WinRT WebAuthenticationCoreManager)..."
+CONOUT "  (fallback: store account token, then local account token)"
 . ObtainToken
 
 if ($null -eq $msaToken) {
-	CONOUT "MSA token not found. Using local authorization..."
+	CONOUT "  MSA token not found. Falling back to local authorization + license request..."
 	LocalEnroll
 }
 
 CONOUT "`n[Step 5] Running ESU enrollment..."
+CONOUT "  Calling ConsumerESUMgr.dll -> EnrollUsingBackupV1 with MSA token..."
 $eRet = DoEnroll
 
 CONOUT "`n[Step 6] Verifying result..."
 CheckEligibility
 
 if ($regionBypassed) {
-	CONOUT "`nRestoring original region..."
+	CONOUT "`n[Cleanup] Restoring original GeoID $origGeoId ..."
 	ReRegion $origGeoId
 }
 
