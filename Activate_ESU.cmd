@@ -177,49 +177,57 @@ function NativeMethods
 	$Win32 = $t.CreateType()
 }
 
-$geoCodeMap = @{
-	244 = "US"; 84 = "GB"; 123 = "NL"; 203 = "RU"; 112 = "BY"; 141 = "KP";
-	148 = "SY"; 170 = "IR"; 261 = "CU"; 39 = "CN"; 94 = "DE"; 68 = "CA";
-}
-
 function ReRegion($gID)
 {
-	$gName = $geoCodeMap[[int]$gID]
-	CONOUT ("    -> Setting HKCU:\Control Panel\International\Geo\Nation = {0}" -f $gID)
-	$null = New-ItemProperty $gKey "Nation" -Value $gID -Type String -Force -EA 0
-	if ($null -ne $gName) {
-		CONOUT ("    -> Setting HKCU:\Control Panel\International\Geo\Name = {0}" -f $gName)
-		$null = New-ItemProperty $gKey "Name" -Value $gName -Type String -Force -EA 0
+	# Use Set-WinHomeLocation — this is the correct API, propagates to WinRT caches
+	# and sends WM_SETTINGCHANGE. Raw registry writes alone do NOT fully update.
+	CONOUT ("    -> Set-WinHomeLocation -GeoId {0}" -f $gID)
+	try {
+		Set-WinHomeLocation -GeoId $gID -EA Stop
+	} catch {
+		CONOUT ("    -> Set-WinHomeLocation failed, falling back to raw registry")
+		$null = New-ItemProperty $gKey "Nation" -Value $gID -Type String -Force -EA 0
 	}
-	# Update HKU:\.DEFAULT (used by SYSTEM-context readers)
+	# Also push HKLM DeviceRegion (used in SYSTEM context)
 	try {
-		if (-Not (Test-Path "HKU:")) {
-			$null = New-PSDrive -Name HKU -PSProvider Registry -Root HKEY_USERS -EA 0
-		}
-		$duKey = "HKU:\.DEFAULT\Control Panel\International\Geo"
-		if (-Not (Test-Path $duKey)) { $null = New-Item $duKey -Force -EA 0 }
-		CONOUT ("    -> Setting HKU:\.DEFAULT\...\Geo\Nation = {0}" -f $gID)
-		$null = New-ItemProperty $duKey "Nation" -Value $gID -Type String -Force -EA 0
-		if ($null -ne $gName) {
-			$null = New-ItemProperty $duKey "Name" -Value $gName -Type String -Force -EA 0
+		if ($null -ne (Get-ItemProperty $rKey -EA 0)) {
+			CONOUT ("    -> HKLM:\...\DeviceRegion = {0}" -f $gID)
+			Copy-Item (Get-Command reg.exe).Source .\reg1.exe -Force -EA 0
+			& .\reg1.exe add "$($rKey.Replace(':',''))" /v DeviceRegion /t REG_DWORD /d $gID /f > $null 2>&1
+			Remove-Item .\reg1.exe -Force -EA 0
 		}
 	} catch {}
-	# Update HKLM DeviceRegion unconditionally (create if missing)
+}
+
+function ClearEligibilityCache
+{
+	# ClipESUConsumer.exe caches the previous result in HKCU — clear before re-evaluate
+	$cKey = "HKCU:\Software\Microsoft\Windows NT\CurrentVersion\Windows\ConsumerESU"
+	if (Test-Path $cKey) {
+		CONOUT ("    -> Clearing eligibility cache in HKCU:\...\ConsumerESU")
+		Remove-ItemProperty $cKey "ESUEligibility"       -EA 0
+		Remove-ItemProperty $cKey "ESUEligibilityResult" -EA 0
+	}
+}
+
+function HasCommercialESU
+{
+	# Check if device already has active key-based (commercial) ESU licenses
 	try {
-		$rParent = $rKey -replace '\\DeviceRegion$', ''
-		if (-Not (Test-Path $rParent)) { $null = New-Item $rParent -Force -EA 0 }
-		CONOUT ("    -> Setting HKLM:\...\CurrentVersion\Control Panel\DeviceRegion = {0}" -f $gID)
-		Copy-Item (Get-Command reg.exe).Source .\reg1.exe -Force -EA 0
-		& .\reg1.exe add "$($rKey.Replace(':',''))" /v DeviceRegion /t REG_DWORD /d $gID /f > $null 2>&1
-		Remove-Item .\reg1.exe -Force -EA 0
+		$esuKey = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SoftwareProtectionPlatform\ESU"
+		if (Test-Path $esuKey) {
+			$p = Get-ItemProperty $esuKey -EA 0
+			if ($p.Win10CommercialKeybasedESUEligible -eq 1) {
+				# Verify at least one ESU add-on is actually Licensed
+				$lic = Get-CimInstance SoftwareLicensingProduct -Filter "ApplicationId='55c92734-d682-4d71-983e-d6ec3f16059f' AND LicenseStatus=1 AND PartialProductKey IS NOT NULL" -EA 0
+				if ($lic) {
+					$names = ($lic | Where-Object { $_.Name -match 'ESU-Year' } | Select-Object -ExpandProperty Name -Unique)
+					if ($names) { return $names }
+				}
+			}
+		}
 	} catch {}
-	# Also set via native Win32 SetUserGeoID API through PowerShell so current session cache updates
-	try {
-		CONOUT ("    -> Calling kernel32.SetUserGeoID({0})" -f $gID)
-		$sig = '[DllImport("kernel32.dll")] public static extern bool SetUserGeoID(int GeoId);'
-		$k32 = Add-Type -MemberDefinition $sig -Name "Kern32" -Namespace "Win32Geo" -PassThru -EA 0
-		$null = $k32::SetUserGeoID([int]$gID)
-	} catch {}
+	return $null
 }
 #endregion
 
@@ -657,6 +665,19 @@ if ($bAcquireLicense) {
 . NativeMethods
 $BSD = RtlBSD
 
+#region PreCheck
+CONOUT "`n[Step 0] Checking for existing Commercial ESU licenses..."
+$comESU = HasCommercialESU
+if ($null -ne $comESU) {
+	CONOUT "  This device already has Commercial (key-based) ESU activated:"
+	foreach ($n in $comESU) { CONOUT ("    - " + $n) }
+	CONOUT "  Commercial ESU = Consumer ESU equivalent (per abbodi1406)."
+	CONOUT "  Nothing to do — ESU is already active."
+	ExitScript 0
+}
+CONOUT "  No Commercial ESU detected. Proceeding with Consumer ESU enrollment."
+#endregion
+
 #region RegionBypass
 $origGeoId = $GeoId
 $regionBypassed = $false
@@ -719,12 +740,25 @@ if ($hRet -eq 0x80080002) {
 
 #region Main
 CONOUT "`n[Step 3] Checking ESU eligibility..."
+ClearEligibilityCache
 CONOUT "  Running: $SysPath\ClipESUConsumer.exe -evaluateEligibility"
 CONOUT "  (writes result to HKCU:\Software\Microsoft\Windows NT\CurrentVersion\Windows\ConsumerESU)"
 . CheckEligibility
 $supported = $false
 if ($null -ne $esuStatus) {
 	$supported = ($esuStatus -ge 2 -And $esuStatus -le 5) -Or ($esuStatus -ge 11 -And $esuStatus -le 14) -Or (($esuStatus -eq 1 -Or $esuStatus -eq 10) -And ($esuResult -ge 13 -And $esuResult -le 15))
+}
+# Result 12 KEY_BASED_ESU — device qualifies for Commercial ESU instead of Consumer.
+# Per abbodi1406: Commercial ESU = Consumer ESU equivalent, so this is a success state.
+if ($esuResult -eq 12) {
+	CONOUT "`n  Result 12 (KEY_BASED_ESU) — device qualifies for Commercial ESU."
+	CONOUT "  This is equivalent (or better) than Consumer ESU."
+	CONOUT "  No Consumer enrollment needed. To activate Commercial ESU, use MAS/TSforge."
+	if ($regionBypassed) {
+		CONOUT "  Restoring original GeoID $origGeoId ..."
+		ReRegion $origGeoId
+	}
+	ExitScript 0
 }
 if (!$supported) {
 	CONOUT "`n  Eligibility status is not supported for enrollment."
